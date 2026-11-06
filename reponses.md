@@ -87,3 +87,151 @@ Pour « Combien de jours de télétravail ? », le premier résultat est `teletr
 Après une deuxième exécution, la base contient toujours 69 chunks : le nombre ne double pas. Chaque chunk a un identifiant stable (`teletravail.pdf-p1-0`, etc.), et `upsert` remplace le chunk s'il existe déjà et l'ajoute sinon. Avec `add`, une deuxième exécution tenterait d'insérer des identifiants déjà présents. On obtiendrait des erreurs ou des doublons, et la recherche renverrait plusieurs fois le même texte.
 
 Le jour où un document est modifié, il faut le réindexer. Si on se contente de relancer l'upsert et que la nouvelle version donne moins de chunks, les anciens chunks en trop restent dans la base avec un contenu périmé. Il faut donc d'abord supprimer tous les chunks de ce document (`collection.delete(where={"source": "teletravail.pdf"})`), puis réindexer la nouvelle version.
+
+### Premier dépôt GitHub
+
+#### Q13 Pourquoi base_vectorielle/ n'est-il pas envoyé sur GitHub ?
+
+La base vectorielle n'est pas du code source : c'est un résultat produit à partir des documents par le script d'indexation. Elle est binaire, donc illisible dans un diff, et elle peut devenir lourde. Elle change à chaque réindexation et dépend de la version de Chroma et du modèle d'embedding. En entreprise, elle contient aussi le texte des documents internes, qu'on ne veut pas publier. On la met donc dans le `.gitignore`.
+
+Un collègue qui clone le dépôt crée son environnement virtuel, installe les dépendances avec `pip install -r requirements.txt`, puis lance `python rag-altea/etape4_indexation.py`. Le script relit les documents, les découpe, calcule les embeddings et reconstruit la base à l'identique.
+
+## Exercice 2
+
+### Étape 5 — Recherche
+
+#### Q1. Fonction rechercher
+
+Le code est dans `rag-altea/etape5_recherche.py`. `rechercher` transforme la question en vecteur, interroge la collection avec un filtre facultatif sur le service, et renvoie pour chaque extrait son texte, sa source, sa page, son service et un score égal à 1 − distance. Plus ce score est proche de 1, plus l'extrait est proche de la question.
+
+| Question | 1er résultat | 2e résultat | 3e résultat |
+|---|---|---|---|
+| Combien de jours de télétravail par semaine ? | teletravail.pdf p.1 (0,71) | conges_absences.pdf p.1 (0,62) | conges_absences.pdf p.1 (0,58) |
+| Comment me connecter au VPN depuis chez moi ? | vpn.txt p.1 (0,73) | vpn.txt p.1 (0,73) | vpn.txt p.1 (0,60) |
+| À quelle heure ouvre le site de Lyon ? | horaires.txt p.1 (0,76) | restauration.txt p.1 (0,58) | demande_materiel.txt p.1 (0,57) |
+
+Le bon document arrive en tête pour les trois questions.
+
+#### Q2 k = 1, 3 et 10
+
+Sur la question « Quel est le plafond de remboursement d'un repas ? », k = 1 ne renvoie que `notes_de_frais.pdf` p.2, qui décrit la procédure de remboursement mais pas les montants. Avec k = 3, on récupère aussi la page 1, qui contient le tableau des plafonds (20 €, 30 €, 50 €). Avec k = 10, on obtient en plus des extraits de `mutuelle.pdf`, `restauration.txt` ou `horaires.txt`, dont les scores descendent jusqu'à 0,28 et qui n'ont rien à voir avec la question.
+
+Quand k augmente, on a plus de chances que la bonne information soit dans les extraits : on gagne en rappel. En échange, on ajoute du bruit qui peut égarer le LLM, le prompt devient plus long et la génération plus lente. Une valeur autour de 3 est un bon compromis pour ce corpus.
+
+#### Q3 Filtre par service
+
+Avec `service="RH"`, la question sur le télétravail donne le même résultat que sans filtre : `teletravail.pdf` arrive en tête avec un score de 0,71. Avec `service="IT"`, la recherche ne peut plus voir les documents RH. Elle renvoie quand même trois extraits (`demande_materiel.txt`, `securite_emails.txt`), mais avec des scores faibles d'environ 0,42 et sans rapport avec la question. La recherche renvoie toujours k résultats, même quand aucun n'est pertinent.
+
+Ce filtre est une première étape vers la confidentialité, car il permet de limiter un utilisateur aux documents de son périmètre. Un salarié qui n'a pas accès aux documents RH ne recevrait jamais d'extrait RH dans sa réponse. Il ne suffit pas pour autant. Ici, c'est le programme qui choisit le service, sans savoir qui pose la question : il n'y a ni authentification ni gestion des droits. Les documents restent tous dans la même base, lisible par quiconque y a accès. Enfin, la notion de service est trop grossière : un document RH peut être public pour tous, alors qu'un autre, comme une fiche de paie, ne doit être visible que par une seule personne. Une vraie solution associe à chaque chunk des droits d'accès vérifiés à partir de l'identité de l'utilisateur, ou utilise des bases séparées.
+
+### Étape 6 — Génération
+
+#### Q4. Prompt complet
+
+Le code est dans `rag-altea/etape6_generation.py`. `construire_prompt` numérote chaque extrait sous la forme `[i] (source, page)`, suivi de son texte et d'une ligne vide. Prompt envoyé pour « Combien de jours de télétravail par semaine ? » (extraits abrégés) :
+
+```
+Tu es l'assistant interne d'Altéa Services.
+Réponds à la question en utilisant UNIQUEMENT les extraits ci-dessous.
+Après chaque information, indique le numéro de l'extrait entre crochets, par exemple [1].
+Si les extraits ne contiennent pas la réponse, réponds exactement : "Je ne trouve pas cette information dans la documentation."
+Extraits :
+[1] (teletravail.pdf, page 1)
+... Chaque salarié éligible peut télétravailler jusqu'à 2 jours par semaine. ...
+
+[2] (conges_absences.pdf, page 1)
+... 30 jours ouvrables (5 semaines) pour une année complète. ...
+
+[3] (conges_absences.pdf, page 1)
+... au moins 1 mois à l'avance pour une absence de plus d'une semaine.
+
+Question : Combien de jours de télétravail par semaine ?
+Réponse :
+```
+
+Les quatre premières lignes forment la consigne : le rôle de l'assistant, l'obligation de n'utiliser que les extraits, la citation des sources et la phrase de repli. Viennent ensuite les extraits numérotés renvoyés par la recherche, avec leur source et leur page. La question du salarié termine le prompt, suivie de « Réponse : » pour que le modèle enchaîne.
+
+#### Q5. Cinq questions dont deux sans réponse
+
+| Question | Réponse juste ? | Sources citées ? | Phrase de repli quand il le fallait ? |
+|---|---|---|---|
+| Combien de jours de télétravail par semaine ? | Oui (2 jours, 1 pour les alternants) | Oui, mais le « 2 jours » est attribué à [2] au lieu de [1] | Non concerné |
+| Comment réinitialiser mon mot de passe ? | Oui | Non, aucun numéro d'extrait | Non concerné |
+| Quel est le plafond pour un repas du midi en déplacement ? | Non, répond par la phrase de repli alors que la réponse (20 €) est dans l'extrait [2] | Non | Non, repli à tort |
+| Quel temps fera-t-il demain ? | Oui | Non concerné | Oui |
+| Quel est le salaire du directeur général ? | Oui | Non concerné | Oui |
+
+Le modèle respecte bien la consigne de repli pour les questions hors documentation. En revanche, il cite mal ou pas du tout ses sources. Pour le repas du midi, le découpage a coupé le tableau au milieu du libellé (« …en déplacem » | « ent 20 € par repas »). L'extrait reçu commence donc par « 20 € par repas » sans dire de quel repas il s'agit, et le modèle préfère le repli.
+
+#### Q6 LLM seul et hallucination
+
+Posée directement à llama3.2, la question « Combien de jours de télétravail par semaine sont autorisés chez Altéa ? » obtient : « Je ne peux pas fournir d'informations sur les politiques d'entreprise spécifiques… ». Avec le RAG, la réponse est « Chaque salarié éligible peut télétravailler jusqu'à 2 jours par semaine », ce qui est exact. Ici le modèle seul a refusé au lieu d'inventer, mais il ne sait rien d'Altéa, qui ne figure pas dans ses données d'entraînement : un autre modèle, ou le même avec une question formulée autrement, aurait très bien pu répondre « 2 à 3 jours » avec assurance.
+
+Une hallucination est une réponse fausse ou inventée que le modèle formule avec la même assurance qu'une réponse juste. Le RAG la limite en donnant au modèle les extraits des vrais documents et en lui demandant de ne répondre qu'à partir d'eux, avec une phrase de repli quand l'information manque. La citation des sources permet en plus au salarié de vérifier la réponse.
+
+#### Q7 Pourquoi temperature=0 ?
+
+La température règle la part de hasard dans le choix des mots du modèle. À 0, le modèle prend toujours le mot le plus probable : la même question donne la même réponse, et il s'en tient au plus près des extraits. Pour un assistant documentaire, on veut des réponses exactes, reproductibles et vérifiables, pas de la créativité. Une température plus élevée augmente le risque que le modèle reformule un chiffre de travers ou invente un détail. Elle rendrait aussi l'évaluation de l'étape 7 instable, puisque deux exécutions pourraient donner des résultats différents.
+
+### Étape 7 — Évaluation
+
+#### Q8. Fichier evaluation.csv
+
+Le fichier `rag-altea/evaluation.csv` contient les 10 questions du corrigé, formulées comme un salarié les poserait, avec le document qui contient la réponse. Les questions qui contiennent une virgule sont entre guillemets pour que le CSV reste lisible.
+
+#### Q9. Taux de réussite de la recherche
+
+Le code est dans `rag-altea/etape7_evaluation.py`. Une question est réussie si le document attendu figure parmi les sources des k extraits renvoyés.
+
+| k | Questions où le bon document est trouvé |
+|--:|--:|
+| 1 | 90 % |
+| 3 | 100 % |
+| 5 | 100 % |
+
+Le seul échec à k = 1 est « Comment adhérer à la mutuelle ? », pour laquelle `charte_informatique.pdf` arrive devant `mutuelle.pdf`.
+
+#### Q10. Notation des 10 réponses générées
+
+Avec les réglages retenus (chunks de 500, k = 3), voici les réponses obtenues par `python rag-altea/etape7_evaluation.py --reponses`, comparées aux réponses du corrigé :
+
+| Question | Réponse | Sources exactes ? |
+|---|---|---|
+| Télétravail par semaine | Partielle : 2 jours, mais oublie « jamais le mardi » | Non, le « 2 jours » est attribué à [2] (conges_absences.pdf) |
+| Réinitialiser son mot de passe | Juste | Oui [1] |
+| Poser un congé | Juste | Non, aucune citation |
+| Plafond d'un repas | Fausse : phrase de repli | Non |
+| Adhérer à la mutuelle | Fausse : « l'adhésion est automatique » au lieu du bulletin à rendre sous 30 jours | Non, aucune citation |
+| Problème de VPN | Fausse : phrase de repli | Non |
+| Nouvel ordinateur | Juste | Oui [2] |
+| E-mail suspect | Juste | Non, aucune citation |
+| Ouverture du site de Lyon | Juste | Oui [1] |
+| Fumer dans les locaux | Juste | Oui [1] |
+
+On obtient 60 % de réponses justes (6 sur 10, plus une partielle) et 40 % de réponses correctement sourcées (4 sur 10). La recherche trouve le bon document pour toutes les questions à k = 3, mais la génération perd beaucoup en route.
+
+#### Q11 Analyse d'une réponse fausse
+
+Pour « Mon VPN ne fonctionne pas, que faire ? », l'assistant a répondu par la phrase de repli. Pourtant, à l'étape 5, les trois extraits renvoyés venaient tous de `vpn.txt` : le bon document avait été trouvé, l'erreur vient donc de la génération. Avec des chunks de 500 caractères, la liste « Je n'arrive pas à me connecter au VPN : que faire ? » est coupée en plusieurs morceaux, si bien qu'aucun extrait ne contient à la fois la question et les étapes de dépannage, et le petit modèle llama3.2 préfère le repli. Le même problème explique l'échec sur le repas, où le tableau des plafonds est coupé au milieu d'un libellé.
+
+L'amélioration testée consiste à agrandir les chunks à 1000 caractères avec 100 de chevauchement, pour qu'une section entière tienne dans un seul extrait, en gardant k = 3. La réponse VPN devient juste : elle reprend les vérifications (connexion internet, heure de l'ordinateur, réseau public, redémarrage) et le poste 4444. Sur les 10 questions, la recherche reste à 100 %, on passe à 70 % de réponses justes (7 sur 10, plus deux partielles) et à 70 % de réponses correctement sourcées. La question sur la mutuelle reste fausse, et le modèle y invente même des étapes et un extrait [6] qui n'existe pas. La section « Comment adhérer » n'est pas dans les extraits renvoyés. Il faudrait donc aussi améliorer la recherche pour cette question, par exemple en retirant les en-têtes répétés (Q4) ou en augmentant k.
+
+### Étape 8 — Mise à disposition et GitHub
+
+#### Q12. Interface Streamlit
+
+Le code est dans `rag-altea/app.py` et se lance avec `streamlit run rag-altea/app.py`. La page affiche un champ de question, puis la réponse générée et, sous le titre « Sources », un bloc dépliable par extrait, intitulé « [i] source, page X ». Une fois déplié, il montre le service, le score et le texte de l'extrait. Pour « À quelle heure ouvre le site de Lyon ? », l'application répond « Le site de Lyon ouvre à 7 h 30. [1] », avec `horaires.txt`, page 1 comme premier extrait.
+
+#### Q13. README et publication
+
+Le `README.md` à la racine du dépôt présente l'objectif du projet, l'installation, l'ordre de lancement des scripts, un exemple de question, les résultats de l'étape 7, les limites connues et les auteurs. Le fichier `requirements.txt` est généré avec `pip freeze`. Le projet est ensuite publié avec un commit, un `git push` et le tag `v1.0`.
+
+#### Q14 Points à traiter avant un déploiement à tous les salariés
+
+Les droits d'accès selon le salarié sont le premier point. Aujourd'hui, tout le monde peut interroger tous les documents. Il faut identifier l'utilisateur, par exemple via l'annuaire de l'entreprise, et filtrer les chunks selon ses droits avant qu'ils n'arrivent au LLM.
+
+Les données personnelles dans les documents posent un deuxième problème. Des documents RH peuvent contenir des noms, des salaires ou des informations de santé. Il faut les repérer et les anonymiser ou les exclure avant l'indexation, et respecter le RGPD, notamment pour la conservation des questions posées.
+
+La mise à jour des documents doit aussi être automatisée. Une procédure doit détecter les documents ajoutés, modifiés ou supprimés, retirer leurs anciens chunks et les réindexer. Sinon, l'assistant donnera avec assurance des règles qui ne sont plus en vigueur.
+
+Enfin, il faut chiffrer le coût et l'hébergement du LLM. Un modèle local comme llama3.2 garde les données en interne, mais il demande des serveurs avec GPU pour répondre vite à des centaines de salariés, et sa qualité reste limitée. Un modèle en ligne est meilleur mais envoie les documents à un tiers et se paie à l'usage. Le choix dépend du budget et de la sensibilité des données.
